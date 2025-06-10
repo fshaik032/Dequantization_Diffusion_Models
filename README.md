@@ -43,7 +43,7 @@ python run_palette.py --doCN --logdir logs/ --data_mode="T" --max_val_img=20 --t
 
 ## Interactive Demo
 - We provide 2 interactive demo scripts ```color.py``` for palette transferring and ```segment.py``` for object recoloring.
-- To use scripts with default settings simply run ```python color.py``` and ```python segment.py``` 
+- To use scripts with default settings simply run ```python color.py``` and ```python segment.py --share --server_port 8080``` 
 
 ## Example Images: Palette Transfer
 <p align="center">
