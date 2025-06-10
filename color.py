@@ -1,399 +1,590 @@
-# from share import *
-import config
+"""
+Production-ready Colorize Diffusion Application
+
+A refactored version of the colorize diffusion script with improved structure,
+error handling, and maintainability.
+"""
 
 import argparse
-import matplotlib
+import logging
+from pathlib import Path
+from typing import Optional, Tuple, List, Dict, Any
+from dataclasses import dataclass
+from functools import partial
+
 import cv2
 import einops
-import re
 import gradio as gr
+import matplotlib
 import numpy as np
 import torch
 from PIL import Image
-
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial import distance_matrix
 
-from functools import partial
 from deepfloyd_if.modules.stage_II import IFStageII
 
-grad_channels = 0
-
-stage_2 = 0
-
-MAX_COLORS = 128
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
-def load(model_load_path, sam_path):
-
-    #options
-    IMAGE_SIZE = 256
-    aux_channels = 7
-    doCN = True
-    force_aux_8 = False
-    mpath = 'IF-II-M-v1.0' #small version of DeepFloyd
-    #"/home/faariss2/G.pt"
-
-    model_kwargs = {'doCN': doCN, 'aux_ch': aux_channels + (8 - aux_channels % 8) % 8 if force_aux_8 else aux_channels, 'attention_resolutions': '32,16'}
-
-    global stage_2
-    stage_2 = IFStageII(mpath, device='cuda:0', filename=model_load_path, model_kwargs=model_kwargs)
-
-    def _setDtype(stage_2):
-        stage_2.model.dtype = torch.float32 #tested on float32 mixed precision
-        stage_2.model.precision = '32' 
-        if doCN:
-            stage_2.model.control_model.dtype = stage_2.model.dtype
-            stage_2.model.control_model.precision = stage_2.model.precision
-        for name, p in stage_2.model.named_parameters():
-            p.data = p.type(stage_2.model.dtype)
+@dataclass
+class AppConfig:
+    """Configuration class for the application."""
+    image_size: int = 256
+    aux_channels: int = 7
+    do_cn: bool = True
+    force_aux_8: bool = False
+    model_path: str = 'IF-II-M-v1.0'
+    max_colors: int = 128
+    device: str = 'cuda:0'
+    
+    # Gradio settings
+    server_name: str = "0.0.0.0"
+    server_port: int = 7860
+    share: bool = True
+    debug: bool = True
 
 
-    _setDtype(stage_2)
-
-    for name, p in stage_2.model.named_parameters():
-        p.requires_grad = False
-
-    stage_2.model.eval()
-
-    return
-
-def resize_image(input_image, resolution):
-    H, W, C = input_image.shape
-    H = float(H)
-    W = float(W)
-    k = float(resolution) / min(H, W)
-    H *= k
-    W *= k
-    #round to closest number divisible by 16
-    H = int(np.round(H / 16.0)) * 16
-    W = int(np.round(W / 16.0)) * 16
-    img = cv2.resize(input_image, (W, H), interpolation=cv2.INTER_LANCZOS4 if k > 1 else cv2.INTER_AREA)
-    return img
-
-
-def center_crop(arr, new_height, new_width):
-    #center crops image to be new_height new_width
-    h, w = arr.shape[:2]
-    start_y = max(0, (h - new_height) // 2)
-    start_x = max(0, (w - new_width) // 2)
-    return arr[start_y:start_y+new_height, start_x:start_x+new_width]
-
-
-
-
-def sort_colors(color_array):
-        # Ensure the color values are in the range [0, 255] and the correct data type
+class ImageProcessor:
+    """Handles image processing operations."""
+    
+    @staticmethod
+    def resize_image(input_image: np.ndarray, resolution: int) -> np.ndarray:
+        """Resize image while maintaining aspect ratio and ensuring divisibility by 16."""
+        H, W, C = input_image.shape
+        k = float(resolution) / min(H, W)
+        new_H = int(np.round(H * k / 16.0)) * 16
+        new_W = int(np.round(W * k / 16.0)) * 16
+        
+        interpolation = cv2.INTER_LANCZOS4 if k > 1 else cv2.INTER_AREA
+        return cv2.resize(input_image, (new_W, new_H), interpolation=interpolation)
+    
+    @staticmethod
+    def center_crop(arr: np.ndarray, new_height: int, new_width: int) -> np.ndarray:
+        """Center crop image to specified dimensions."""
+        h, w = arr.shape[:2]
+        start_y = max(0, (h - new_height) // 2)
+        start_x = max(0, (w - new_width) // 2)
+        return arr[start_y:start_y+new_height, start_x:start_x+new_width]
+    
+    @staticmethod
+    def sort_colors(color_array: np.ndarray) -> np.ndarray:
+        """Sort colors by HSV values."""
         color_array = np.clip(color_array, 0, 255).astype(np.uint8)
-        
-        # Reshape the array to a 2D array with a single row
         reshaped_array = color_array.reshape((-1, 1, 3))
-        
-        # Convert RGB to HSV
         hsv_colors = cv2.cvtColor(reshaped_array, cv2.COLOR_RGB2HSV)
-        
-        # Reshape back to a 2D array
         hsv_colors = hsv_colors.reshape(-1, 3)
         
-        # Sort primarily by hue, then by saturation, then by value
+        # Sort by hue, saturation, then value
         sorted_indices = np.lexsort((hsv_colors[:, 2], hsv_colors[:, 1], hsv_colors[:, 0]))
-        
-        # Apply the sorting to the original RGB array
-        sorted_colors = color_array[sorted_indices]
-        
-        return sorted_colors
-
-
-def app_options():
-    #Gradio arguments
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--server_name", '-addr', type=str, default="0.0.0.0")
-    parser.add_argument("--server_port", '-port', type=int, default=7860)
-    parser.add_argument("--share", action="store_true")
-    parser.add_argument("--not_show_error", action="store_true")
-    parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--enable_text_manipulation", '-manipulate', action="store_true")
-    parser.add_argument('--model_load_path', required=False, default=None,
-      help='pretrained model, None means train from scratch.')
-    # parser.add('--data_mode', required=False, default='G',
-    #   choices=('L', 'G', 'T'), help='flags for dataset: "L" for we will condition on Luminance. "G" for gradient. "T" for Thresholded gradient.')
-    parser.add_argument('--fp16', action=argparse.BooleanOptionalAction)
-    return parser.parse_args()
-
-
-def apply_palette(pil_image, pil_target, num_colors, transfer_method, cmap, blend): #image and Pal are HWC 0-255 RGB images        
-        height, width = pil_image.size
-
-        if num_colors == None:
-             raise ValueError("Invalid value provided for colors")
-             
-        num_colors = int(num_colors)
-        palette_image = pil_image.convert('P', palette=Image.ADAPTIVE, colors=num_colors)
-        pal_rgb = palette_image.convert('RGB')
-        pal_rgb = np.asarray(pal_rgb)
-        indexed_palette = np.array(palette_image)
-        dst_pal, dst_rgb = 0, 0
-        quantized_source_image, augmented_image_rgb, quantized_augmented_image, source_image = 0, 0, 0, 0
-
-        srcPalette3 = np.array(palette_image.getpalette()[0:3*num_colors]).reshape(num_colors,3)/255.
-        # Get the dimensions of pal_rgb
-        height, width = indexed_palette.shape[:2]
-        fullColor = np.zeros((height,width,3),dtype=np.float32)
-        if transfer_method == 'colormap': #for color map, we're doing most similar color
-            mapQuery = np.arange(0,1 + (1/(2.*num_colors)),1./(num_colors-1))
-            cmap = matplotlib.colormaps[cmap]
-            cm = cmap(mapQuery)[:,0:3]
-            D = np.exp(-distance_matrix(srcPalette3, cm, p=2))
-
-            # Create the discrete palette
-            discrete_indices = np.repeat(np.arange(num_colors), height // num_colors)
-            if len(discrete_indices) < height:
-                discrete_indices = np.pad(discrete_indices, (0, height - len(discrete_indices)), mode='edge')
-            discrete_palette = cm[discrete_indices] 
-            dst_pal = np.repeat(discrete_palette[:, np.newaxis, :], width, axis=1)
-
-            # Create the smoothed color map
-            smoothed_indices = np.linspace(0, 1, height)
-            smoothed_colormap = cmap(smoothed_indices)[:, :3]
-            dst_rgb = np.repeat(smoothed_colormap[:, np.newaxis, :], width, axis=1)
-
-            # Create a gradient from 0 to 1
-            gradient = np.linspace(0, 1, 256)
-            gradient = np.tile(gradient, (50, 1))  # shape (50, 256)
-
-
-            # Apply the colormap
-            colored_gradient = cmap(gradient)  # returns RGBA values
-
-            # Convert to 8-bit RGB
-            rgb_gradient = (colored_gradient[:, :, :3] * 255).astype(np.uint8)
-
-            # Create a PIL Image
-            targ_rgb = Image.fromarray(rgb_gradient)
-
-
-        else:
-            targInt = pil_target.convert('P', palette=Image.ADAPTIVE, colors=num_colors)
-            targ_rgb = np.array(targInt.convert('RGB'))
-            targPalette3 = np.array(targInt.getpalette()[0:3*num_colors]).reshape(num_colors,3)/255.
-            targCol = targ_rgb / 255.
-            targInt = np.array(targInt)
-
-            if transfer_method == 'color':
-                D = np.exp(-distance_matrix(srcPalette3, targPalette3,p=2))
-
-            elif transfer_method == 'negative':
-                D = np.exp(distance_matrix(srcPalette3, targPalette3,p=2))
-
-            elif transfer_method == 'frequency':
-                sortedSrc, countsSrc = np.unique(indexed_palette, return_counts=True)
-                sortedTarg, countsTarg = np.unique(targInt, return_counts=True)
-                A = np.reshape(countsSrc/float(np.sum(countsSrc)),(num_colors,1))
-                B = np.reshape(countsTarg/float(np.sum(countsTarg)),(num_colors,1))
-                D = np.exp(-distance_matrix(A, B,p=2))
-
-            elif transfer_method == 'int':
-                D = np.exp(-distance_matrix(np.sum(srcPalette3,1,keepdims=True), np.sum(targPalette3,1,keepdims=True),p=2))
-                
-            # Create an array of row indices
-            row_indices = np.arange(height)
-            # Calculate which color each row should be (integer division)
-            color_indices = row_indices * num_colors // height
+        return color_array[sorted_indices]
     
-            # Use advanced indexing to create the image array
-            targPalette3 = sort_colors(targPalette3*255) / 255.
-            image_array = targPalette3[color_indices][:, np.newaxis, :]
+    def get_gradient_channels(self, input_image: Image.Image, 
+                            image_resolution: int, mode: str) -> Tuple[Image.Image, np.ndarray]:
+        """Extract gradient channels from input image."""
+        if input_image is None:
+            raise ValueError("Input image cannot be None")
             
-            # Repeat the colors across all columns
-            dst_pal = np.repeat(image_array, width, axis=1)
-
-            dst_rgb = np.asarray(pil_target)
-                        
-        _, matching = linear_sum_assignment(-D)
-
-        for colIDX in range(num_colors):
-            mask = indexed_palette == colIDX
-            if transfer_method == 'colormap':
-                getColor = cm[matching[colIDX],:]
-            else:
-                getMask = targInt==matching[colIDX]
-                getColor = targCol[getMask][0] #get one instance of this color
-            fullColor[mask] = blend * getColor + (1-blend) * srcPalette3[colIDX]
-
-        return [pal_rgb, targ_rgb, (fullColor*255).astype(np.uint8)] #palettized src image, palettized style, style image unmodified
-def getGradResize(input_image, image_resolution, mode):
-    img = resize_image(np.asarray(input_image), image_resolution)
-
-    #must be divisible by 8
-    gray_image = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) 
-   
-    gradients = np.gradient(gray_image)
-
-    resizedIm = Image.fromarray(img)
-    
-    global grad_channels
-    if mode == 'Gradient':
+        img = self.resize_image(np.asarray(input_image), image_resolution)
+        gray_image = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        gradients = np.gradient(gray_image)
+        resized_image = Image.fromarray(img)
+        
+        if mode == 'Gradient':
             grad_channels = np.stack([(g + 255) / (2 * 255.) for g in gradients], axis=-1)
-    elif mode == 'Luminance':
+        elif mode == 'Luminance':
             luminance = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)[:, :, 0] / 255.0
             grad_channels = np.stack([luminance, luminance], axis=-1)
-    elif mode == 'Threshold':
+        elif mode == 'Threshold':
             grad_channels = np.stack([np.greater(np.abs(g), 8).astype(np.float32) for g in gradients], axis=-1)
-    else:
-        raise ValueError("Invalid value provided for mode")
+        else:
+            raise ValueError(f"Invalid mode: {mode}")
+            
+        return resized_image, grad_channels
 
-    return resizedIm
 
-
-def process(palette, num_colors, textureOption):
-    with torch.no_grad():
-        effective_batch_size = 1
-        steps = "super27"
-        aug_level =  0.0
-        support_noise_less_qsample_steps = 0
-        dynamic_thresholding_p = 0.95
-        dynamic_thresholding_c =  1.0
-        sample_loop = 'ddpm'
+class PaletteProcessor:
+    """Handles palette application and color transfer operations."""
+    
+    def __init__(self, config: AppConfig):
+        self.config = config
+    
+    def apply_palette(self, pil_image: Image.Image, pil_target: Optional[Image.Image], 
+                     num_colors: int, transfer_method: str, cmap: str, 
+                     blend: float) -> List[np.ndarray]:
+        """Apply color palette to source image."""
+        if num_colors is None:
+            raise ValueError("Invalid value provided for colors")
+            
         num_colors = int(num_colors)
-        pal = np.asarray(palette)
+        palette_image = pil_image.convert('P', palette=Image.ADAPTIVE, colors=num_colors)
+        pal_rgb = np.asarray(palette_image.convert('RGB'))
+        indexed_palette = np.array(palette_image)
+        
+        src_palette = np.array(palette_image.getpalette()[0:3*num_colors]).reshape(num_colors, 3) / 255.0
+        height, width = indexed_palette.shape[:2]
+        full_color = np.zeros((height, width, 3), dtype=np.float32)
+        
+        if transfer_method == 'colormap':
+            dst_pal, dst_rgb, distance_matrix_d = self._apply_colormap(
+                src_palette, num_colors, height, width, cmap
+            )
+        else:
+            dst_pal, dst_rgb, distance_matrix_d = self._apply_target_palette(
+                pil_target, src_palette, indexed_palette, num_colors, 
+                height, width, transfer_method
+            )
+        # Apply color matching
+        _, matching = linear_sum_assignment(-distance_matrix_d)
 
+        for col_idx in range(num_colors):
+            mask = indexed_palette == col_idx
+            if transfer_method == 'colormap':
+                color_map = matplotlib.colormaps[cmap]
+                map_query = np.arange(0, 1 + (1/(2.*num_colors)), 1./(num_colors-1))
+                cm = color_map(map_query)[:, 0:3]
+                get_color = cm[matching[col_idx], :]
+            else:
+                targ_int = pil_target.convert('P', palette=Image.ADAPTIVE, colors=num_colors)
+                targ_col = np.array(targ_int.convert('RGB')) / 255.0
+                targ_int = np.array(targ_int)
+                get_mask = targ_int == matching[col_idx]
+                get_color = targ_col[get_mask][0]
+            full_color[mask] = blend * get_color + (1 - blend) * src_palette[col_idx]
+        return [pal_rgb, dst_rgb, (full_color * 255).astype(np.uint8)]
+    
+    def _apply_colormap(self, src_palette: np.ndarray, num_colors: int, 
+                       height: int, width: int, cmap: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Apply colormap-based palette transfer."""
+        color_map = matplotlib.colormaps[cmap]
+        map_query = np.arange(0, 1 + (1/(2.*num_colors)), 1./(num_colors-1))
+        cm = color_map(map_query)[:, 0:3]
+        distance_matrix_d = np.exp(-distance_matrix(src_palette, cm, p=2))
+        
+        # Create discrete palette
+        discrete_indices = np.repeat(np.arange(num_colors), height // num_colors)
+        if len(discrete_indices) < height:
+            discrete_indices = np.pad(discrete_indices, (0, height - len(discrete_indices)), mode='edge')
+        discrete_palette = cm[discrete_indices]
+        dst_pal = np.repeat(discrete_palette[:, np.newaxis, :], width, axis=1)
+        
+        # Create smoothed colormap
+        smoothed_indices = np.linspace(0, 1, height)
+        smoothed_colormap = color_map(smoothed_indices)[:, :3]
+        dst_rgb = np.repeat(smoothed_colormap[:, np.newaxis, :], width, axis=1)
+        
+        return dst_pal, (255*dst_rgb).astype(np.uint8), distance_matrix_d
+    
+    def _apply_target_palette(self, pil_target: Image.Image, src_palette: np.ndarray,
+                            indexed_palette: np.ndarray, num_colors: int,
+                            height: int, width: int, transfer_method: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Apply target image-based palette transfer."""
+        targ_int = pil_target.convert('P', palette=Image.ADAPTIVE, colors=num_colors)
+        targ_rgb = np.array(targ_int.convert('RGB'))
+        targ_palette = np.array(targ_int.getpalette()[0:3*num_colors]).reshape(num_colors, 3) / 255.0
+        targ_int_array = np.array(targ_int)
+        
+        if transfer_method == 'color':
+            distance_matrix_d = np.exp(-distance_matrix(src_palette, targ_palette, p=2))
+        elif transfer_method == 'negative':
+            distance_matrix_d = np.exp(distance_matrix(src_palette, targ_palette, p=2))
+        elif transfer_method == 'frequency':
+            distance_matrix_d = self._calculate_frequency_distance(indexed_palette, targ_int_array, num_colors)
+        elif transfer_method == 'int':
+            distance_matrix_d = np.exp(-distance_matrix(
+                np.sum(src_palette, 1, keepdims=True), 
+                np.sum(targ_palette, 1, keepdims=True), p=2
+            ))
+        else:
+            raise ValueError(f"Invalid transfer method: {transfer_method}")
+         #check if quantization ended up with correct amount of colors
+
+        sortedSrc, countsSrc = np.unique(indexed_palette, return_counts=True)
+        sortedTarg, countsTarg = np.unique(targ_int_array, return_counts=True) 
+
+        if len(countsSrc) != len(countsTarg):
+            print(len(countsSrc))
+            print(len(countsTarg))
+            raise ValueError("Palettes don't have same number of colors, try different number of colors")
+         
+        row_indices = np.arange(height)
+        color_indices = row_indices * num_colors // height
+        targ_palette_sorted = self.sort_colors(targ_palette * 255) / 255.0
+        image_array = targ_palette_sorted[color_indices][:, np.newaxis, :]
+        #Palette visualization of target image
+        dst_pal = np.repeat(image_array, width, axis=1)
+
+        dst_rgb = np.asarray(pil_target)
+        
+        return dst_pal, dst_rgb, distance_matrix_d
+    
+    def _calculate_frequency_distance(self, indexed_palette: np.ndarray, 
+                                    targ_int_array: np.ndarray, num_colors: int) -> np.ndarray:
+        """Calculate frequency-based distance matrix."""
+        _, counts_src = np.unique(indexed_palette, return_counts=True)
+        _, counts_targ = np.unique(targ_int_array, return_counts=True)
+        
+        freq_src = counts_src / float(np.sum(counts_src))
+        freq_targ = counts_targ / float(np.sum(counts_targ))
+        
+        freq_src = freq_src.reshape(num_colors, 1)
+        freq_targ = freq_targ.reshape(num_colors, 1)
+        
+        return np.exp(-distance_matrix(freq_src, freq_targ, p=2))
+    
+    def sort_colors(self, color_array: np.ndarray) -> np.ndarray:
+        """Sort colors using ImageProcessor method."""
+        return ImageProcessor.sort_colors(color_array)
+
+
+class DiffusionModel:
+    """Handles the diffusion model operations."""
+    
+    def __init__(self, config: AppConfig):
+        self.config = config
+        self.stage_2: Optional[IFStageII] = None
+        self.empty_prompt_embeddings = None
+        
+    def load_model(self, model_load_path: str) -> None:
+        """Load the diffusion model."""
+        try:
+            model_kwargs = {
+                'doCN': self.config.do_cn,
+                'aux_ch': self.config.aux_channels + (8 - self.config.aux_channels % 8) % 8 if self.config.force_aux_8 else self.config.aux_channels,
+                'attention_resolutions': '32,16'
+            }
+            
+            self.stage_2 = IFStageII(
+                self.config.model_path,
+                device=self.config.device,
+                filename=model_load_path,
+                model_kwargs=model_kwargs
+            )
+            
+            self._configure_model()
+            self._load_empty_prompt()
+            
+            logger.info("Model loaded successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to load model: {e}")
+            raise
+    
+    def _configure_model(self) -> None:
+        """Configure model settings."""
+        self.stage_2.model.dtype = torch.float32
+        self.stage_2.model.precision = '32'
+        
+        if self.config.do_cn:
+            self.stage_2.model.control_model.dtype = self.stage_2.model.dtype
+            self.stage_2.model.control_model.precision = self.stage_2.model.precision
+        
+        for name, param in self.stage_2.model.named_parameters():
+            param.data = param.type(self.stage_2.model.dtype)
+            param.requires_grad = False
+        
+        self.stage_2.model.eval()
+    
+    def _load_empty_prompt(self) -> None:
+        """Load empty prompt embeddings."""
+        try:
+            self.empty_prompt_embeddings = torch.from_numpy(
+                np.load('empty_prompt_1_77_4096.npz', allow_pickle=True)['arr']
+            ).to(self.config.device)
+        except FileNotFoundError:
+            logger.warning("Empty prompt embeddings file not found. Using default.")
+            # Create default empty embeddings if file not found
+            self.empty_prompt_embeddings = torch.zeros(1, 77, 4096, device=self.config.device)
+    
+    def generate(self, palette: Image.Image, num_colors: int, 
+                texture_option: bool, grad_channels: np.ndarray,
+                use_fp16: bool = False) -> List[np.ndarray]:
+        """Generate image using the diffusion model."""
+        if self.stage_2 is None:
+            raise RuntimeError("Model not loaded. Call load_model() first.")
+        
+        try:
+            with torch.no_grad():
+                return self._run_inference(palette, num_colors, texture_option, 
+                                         grad_channels, use_fp16)
+        except Exception as e:
+            logger.error(f"Generation failed: {e}")
+            raise
+    
+    def _run_inference(self, palette: Image.Image, num_colors: int,
+                      texture_option: bool, grad_channels: np.ndarray,
+                      use_fp16: bool) -> List[np.ndarray]:
+        """Run model inference."""
+        pal = np.asarray(palette)
         height, width = pal.shape[:2]
         
-        detected_map = np.ones((height, width, 7), dtype=np.float32) #7 channels in the conditioning
+        # Prepare conditioning
+        detected_map = self._prepare_conditioning(
+            pal, height, width, num_colors, texture_option, grad_channels
+        )
         
-
-        texture_channel = np.ones((height, width))
-        if textureOption:
-            texture_channel[:,:] = 0
-
-        color_indicator = np.full((height, width), num_colors / (2 * MAX_COLORS))
-
-        detected_map = np.ones((height, width, 7))
-
-        detected_map[:, :, :3] = np.asarray(palette)
-        detected_map[:, :, 3:5] = grad_channels #(grad[0] +255)/2 #
-     
-
-        detected_map[:, :, 5] = color_indicator
-        detected_map[:, :, 6] = texture_channel
-
-
-    
-        detected_map[:, :, :3] /= 255.0
-
-        color = np.copy(detected_map[:, :, :3])
-
-        if opt.fp16:
-            control = torch.from_numpy(detected_map.copy()).half().cuda()
-            color = torch.from_numpy(color.copy()).half().cuda()
-        else:
-            control = torch.from_numpy(detected_map.copy()).float().cuda()
-            color = torch.from_numpy(color.copy()).float().cuda()
-
-
-        # control = np.transpose(detected_map, (2, 0, 1))
-        control = torch.stack([control for _ in range(1)], dim=0)
-        control = einops.rearrange(control, 'b h w c -> b c h w').clone()
-
-        color = torch.stack([color for _ in range(1)], dim=0)
-        color = einops.rearrange(color, 'b h w c -> b c h w').clone()
-        # text_prompts = torch.from_numpy(np.load('empty_prompt_1_77_4096.npz', allow_pickle=True)[
-        #                         'arr']).to('cuda:0').repeat(1, 1, 1)
-        text_prompts = torch.from_numpy(np.load('empty_prompt_1_77_4096.npz', allow_pickle=True)[
-                                'arr']).to('cuda:0').repeat(effective_batch_size, 1, 1)
-
+        # Convert to tensors
+        dtype = torch.float16 if use_fp16 else torch.float32
+        control = torch.from_numpy(detected_map.copy()).type(dtype).cuda()
+        color = torch.from_numpy(detected_map[:, :, :3].copy()).type(dtype).cuda()
+        
+        # Reshape for model
+        control = control.unsqueeze(0)
+        control = einops.rearrange(control, 'b h w c -> b c h w')
+        
+        color = color.unsqueeze(0)
+        color = einops.rearrange(color, 'b h w c -> b c h w')
+        
+        # Get text embeddings
+        text_prompts = self.empty_prompt_embeddings.repeat(1, 1, 1)
+        
+        # Run inference
         with torch.autocast("cuda", dtype=torch.float16):
-            out, metadata = stage_2.embeddings_to_image(sample_timestep_respacing=str(steps), 
-                low_res=2*color-1, support_noise=2*color-1,
-                support_noise_less_qsample_steps=support_noise_less_qsample_steps, 
-                seed=None, t5_embs=text_prompts[0:1, ...], hint=2*control-1, 
-                aug_level=aug_level, sample_loop=sample_loop, 
-                dynamic_thresholding_p=dynamic_thresholding_p,dynamic_thresholding_c=dynamic_thresholding_c)
+            out, metadata = self.stage_2.embeddings_to_image(
+                sample_timestep_respacing="super27",
+                low_res=2*color-1,
+                support_noise=2*color-1,
+                support_noise_less_qsample_steps=0,
+                seed=None,
+                t5_embs=text_prompts[0:1, ...],
+                hint=2*control-1,
+                aug_level=0.0,
+                sample_loop='ddpm',
+                dynamic_thresholding_p=0.95,
+                dynamic_thresholding_c=1.0
+            )
         
-        out = (out + 1)/2
-
+        out = (out + 1) / 2
+        result = (255 * out.squeeze().cpu().numpy().transpose(1, 2, 0)).astype(np.uint8)
         
-        # if seed == -1:
-        #     seed = random.randint(0, 65535)
-        # seed_everything(seed)
-
-        # if config.save_memory:
-        #     model.low_vram_shift(is_diffusing=False)
-
-        # cond = {"c_concat": [control], "c_crossattn": [model.get_learned_conditioning([', ' + a_prompt] * num_samples)]}
-        # un_cond = {"c_concat": None if guess_mode else [control], "c_crossattn": [model.get_learned_conditioning([n_prompt] * num_samples)]}
-        # #change all 512s back
-
-      
+        return [result]
+    
+    def _prepare_conditioning(self, pal: np.ndarray, height: int, width: int,
+                            num_colors: int, texture_option: bool,
+                            grad_channels: np.ndarray) -> np.ndarray:
+        """Prepare conditioning tensor for the model."""
+        detected_map = np.ones((height, width, 7), dtype=np.float32)
         
-        x_samples = [(255*out.squeeze().cpu().numpy().transpose(1,2,0)).astype(np.uint8)]
-
-        results = [x_samples[i] for i in range(1)]
-        # Image.fromarray(results[0]-np.asarray(input_image)).save("res.jpg")
-
-
-    return results
-
-
-
-
-opt = app_options()
-
-img_with_mask = partial(gr.Image, type="pil", height=300, interactive=True, show_label=True)
-
-with gr.Blocks(
-        title="Colorize Diffusion",
-        theme=gr.themes.Soft(),
-        elem_id="main-interface",
-        analytics_enabled=False
-) as block:
-    with gr.Row(elem_id="content-row", equal_height=False, variant="panel"):
-                with gr.Column():
-                    image_resolution = gr.Slider(label="Image Resolution", minimum=256, maximum=1088, value=256, step=64)
-                    model_path = gr.Textbox(value="/home/faariss2/G.pt", label="model_path")
-                    load_models = gr.Button("Load Models", variant="secondary", size="sm")
-                    mode = gr.Radio(["Luminance", "Gradient", "Threshold"], label="Mode")
-                    transfer_method = gr.Radio(["colormap", "color", "frequency", "negative", "int"], label="method")
-                    colors = gr.Radio(["16", "32", "64"], label="Number of Colors")
-                    cmap = gr.Textbox(value="viridis", label="colormap")
-                    blend = gr.Slider(minimum=0.0, maximum=1, label="blend", value=1)
-                    
-                with gr.Column():
-                    input_image = gr.Image(label = "Source", sources='upload', type="pil")
-                    ColorImage =  gr.Image(label = "Target", sources='upload', type="pil")
-                    quantize = gr.Button(value="Quantize")
-                    q_source = gr.Image(label = "Quantized Source", sources='upload', type="pil")
-                    q_target = gr.Image(label = "Quantized Target", sources='upload', type="pil")
-                    palette = gr.Image(label = "Palette",sources='upload', type="pil")
-                    # with gr.Accordion("Advanced options", open=False):
-                        # steps = gr.Textbox(value="super27", label="steps")
-                        # aug_level = gr.Number(value = 0.0, label="aug_level")
-                        # support_noise_less_qsample_steps = gr.Number(value = 0, label="support_noise_less_qsample_steps")
-                        # dynamic_thresholding_p = gr.Number(value = 0.95,label="dynamic_thresholding_p")
-                        # dynamic_thresholding_c = gr.Number(value = 1.0,label="dynamic_thresholding_p")
-                        # sample_loop = gr.Textbox(value='ddpm', label="sample_loop")
-
-                    textureOption = gr.Checkbox(label="Texture Dropout", info="Check to Dropout Texture Layer")
-                    run_button = gr.Button("🚀 Generate", variant="primary", size="lg")
+        # Color channels
+        detected_map[:, :, :3] = pal / 255.0
+        
+        # Gradient channels
+        detected_map[:, :, 3:5] = grad_channels
+        
+        # Color indicator
+        color_indicator = np.full((height, width), num_colors / (2 * self.config.max_colors))
+        detected_map[:, :, 5] = color_indicator
+        
+        # Texture channel
+        texture_channel = np.zeros((height, width)) if texture_option else np.ones((height, width))
+        detected_map[:, :, 6] = texture_channel
+        
+        return detected_map
 
 
-                with gr.Column():
-                    result = gr.Gallery(label='Generated Image', show_label=True, elem_id="gallery", preview=True)
-
-
+class ColorizeDiffusionApp:
+    """Main application class."""
+    
+    def __init__(self, config: AppConfig):
+        self.config = config
+        self.image_processor = ImageProcessor()
+        self.palette_processor = PaletteProcessor(config)
+        self.diffusion_model = DiffusionModel(config)
+        self.current_grad_channels = None
+        
+    def load_models(self, model_path: str) -> str:
+        """Load the diffusion models."""
+        try:
+            self.diffusion_model.load_model(model_path)
+            return "Models loaded successfully!"
+        except Exception as e:
+            return f"Failed to load models: {e}"
+    
+    def process_input_image(self, input_image: Optional[Image.Image],
+                          image_resolution: int, mode: str) -> Optional[Image.Image]:
+        """Process input image and extract gradient channels."""
+        if input_image is None:
+            return None
             
-  
-
-    run_button.click(fn=process, inputs=[palette, colors, textureOption], outputs=[result])
-    quantize.click(fn=apply_palette, inputs=[input_image,ColorImage, colors, transfer_method, cmap, blend], outputs=[q_source, q_target, palette])
-    input_image.input(fn=getGradResize, inputs=[input_image, image_resolution, mode], outputs=[input_image])
-    load_models.click(fn=load, inputs=[model_path])
-
-    block.launch(
-            server_name=opt.server_name,
-            share=True,
-            show_error=not opt.not_show_error,
-            debug=True,
+        try:
+            resized_image, grad_channels = self.image_processor.get_gradient_channels(
+                input_image, image_resolution, mode
+            )
+            self.current_grad_channels = grad_channels
+            return resized_image
+        except Exception as e:
+            logger.error(f"Failed to process input image: {e}")
+            return None
+    
+    def apply_palette(self, input_image: Optional[Image.Image], 
+                     color_image: Optional[Image.Image], num_colors: str,
+                     transfer_method: str, cmap: str, blend: float) -> List[Optional[Image.Image]]:
+        """Apply color palette to the input image."""
+        if input_image is None:
+            return [None, None, None]
+            
+        try:
+            num_colors_int = int(num_colors)
+            results = self.palette_processor.apply_palette(
+                input_image, color_image, num_colors_int, transfer_method, cmap, blend
+            )
+            return [Image.fromarray(result) for result in results]
+        except Exception as e:
+            logger.error(f"Failed to apply palette: {e}")
+            return [None, None, None]
+    
+    def generate_image(self, palette: Optional[Image.Image], num_colors: str,
+                      texture_option: bool) -> List[Image.Image]:
+        """Generate final image using diffusion model."""
+        if palette is None or self.current_grad_channels is None:
+            return []
+            
+        try:
+            num_colors_int = int(num_colors)
+            results = self.diffusion_model.generate(
+                palette, num_colors_int, texture_option, 
+                self.current_grad_channels, self.config.fp16 if hasattr(self.config, 'fp16') else False
+            )
+            return [Image.fromarray(result) for result in results]
+        except Exception as e:
+            logger.error(f"Failed to generate image: {e}")
+            return []
+    
+    def create_interface(self) -> gr.Blocks:
+        """Create the Gradio interface."""
+        with gr.Blocks(
+            title="Colorize Diffusion",
+            theme=gr.themes.Soft(),
+            elem_id="main-interface",
+            analytics_enabled=False
+        ) as interface:
+            
+            with gr.Row(elem_id="content-row", equal_height=False, variant="panel"):
+                # Controls column
+                with gr.Column():
+                    image_resolution = gr.Slider(
+                        label="Image Resolution", minimum=256, maximum=1088, 
+                        value=256, step=64
+                    )
+                    model_path = gr.Textbox(
+                        value="/home/G.pt", label="Model Path"
+                    )
+                    load_models_btn = gr.Button("Load Models", variant="secondary", size="sm")
+                    load_status = gr.Textbox(label="Load Status", interactive=False)
+                    
+                    mode = gr.Radio(
+                        ["Luminance", "Gradient", "Threshold"], 
+                        label="Processing Mode", value="Gradient"
+                    )
+                    transfer_method = gr.Radio(
+                        ["colormap", "color", "frequency", "negative", "int"],
+                        label="Transfer Method", value="color"
+                    )
+                    colors = gr.Radio(
+                        ["16", "32", "64"], label="Number of Colors", value="32"
+                    )
+                    cmap = gr.Textbox(value="viridis", label="Colormap")
+                    blend = gr.Slider(
+                        minimum=0.0, maximum=1.0, label="Blend Factor", value=1.0
+                    )
+                
+                # Input/Processing column
+                with gr.Column():
+                    input_image = gr.Image(label="Source Image", sources=['upload'], type="pil")
+                    color_image = gr.Image(label="Target Image", sources=['upload'], type="pil")
+                    quantize_btn = gr.Button("Quantize", variant="secondary")
+                    
+                    q_source = gr.Image(label="Quantized Source", type="pil")
+                    q_target = gr.Image(label="Quantized Target", type="pil")
+                    palette = gr.Image(label="Palette", type="pil")
+                    
+                    texture_option = gr.Checkbox(
+                        label="Texture Dropout", 
+                        info="Check to dropout texture layer"
+                    )
+                    generate_btn = gr.Button("🚀 Generate", variant="primary", size="lg")
+                
+                # Output column
+                with gr.Column():
+                    result = gr.Gallery(
+                        label='Generated Image', show_label=True, 
+                        elem_id="gallery", preview=True
+                    )
+            
+            # Event handlers
+            load_models_btn.click(
+                fn=self.load_models, 
+                inputs=[model_path], 
+                outputs=[load_status]
+            )
+            
+            input_image.input(
+                fn=self.process_input_image,
+                inputs=[input_image, image_resolution, mode],
+                outputs=[input_image]
+            )
+            
+            quantize_btn.click(
+                fn=self.apply_palette,
+                inputs=[input_image, color_image, colors, transfer_method, cmap, blend],
+                outputs=[q_source, q_target, palette]
+            )
+            
+            generate_btn.click(
+                fn=self.generate_image,
+                inputs=[palette, colors, texture_option],
+                outputs=[result]
+            )
+        
+        return interface
+    
+    def launch(self) -> None:
+        """Launch the application."""
+        interface = self.create_interface()
+        interface.launch(
+            server_name=self.config.server_name,
+            server_port=self.config.server_port,
+            share=self.config.share,
+            debug=self.config.debug
         )
 
 
+def parse_arguments() -> argparse.Namespace:
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description="Colorize Diffusion App")
+    parser.add_argument("--server_name", "-addr", type=str, default="0.0.0.0")
+    parser.add_argument("--server_port", "-port", type=int, default=7860)
+    parser.add_argument("--share", action="store_true")
+    parser.add_argument("--not_show_error", action="store_true")
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--enable_text_manipulation", "-manipulate", action="store_true")
+    parser.add_argument("--model_load_path", required=False, default=None,
+                       help="Pretrained model path")
+    parser.add_argument("--fp16", action=argparse.BooleanOptionalAction)
+    return parser.parse_args()
+
+
+def main():
+    """Main function to run the application."""
+    args = parse_arguments()
+    
+    # Create configuration
+    config = AppConfig(
+        server_name=args.server_name,
+        server_port=args.server_port,
+        share=True,
+        debug=args.debug
+    )
+    
+    if hasattr(args, 'fp16'):
+        config.fp16 = args.fp16
+    
+    # Create and launch app
+    app = ColorizeDiffusionApp(config)
+    app.launch()
+
+
+if __name__ == "__main__":
+    main()
